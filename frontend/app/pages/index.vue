@@ -3,6 +3,8 @@ const API_BASE = "http://localhost:8000"
 
 const models = ref<string[]>([])
 const selectedModel = ref("")
+const workspaces = ref<string[]>([])
+const selectedWorkspace = ref("")
 const prompt = ref("")
 const answer = ref("")
 const loading = ref(false)
@@ -28,7 +30,22 @@ const loadModels = async () => {
   }
 }
 
-onMounted(loadModels)
+const loadWorkspaces = async () => {
+  try {
+    const res = await $fetch<{ workspaces: string[] }>(`${API_BASE}/api/workspaces`)
+    workspaces.value = res.workspaces
+    if (workspaces.value.length > 0) {
+      selectedWorkspace.value = workspaces.value[0]
+    }
+  } catch (e: any) {
+    errorMessage.value = `ワークスペース一覧の取得に失敗しました: ${e.message ?? e}`
+  }
+}
+
+onMounted(() => {
+  loadModels()
+  loadWorkspaces()
+})
 
 const handleChatResponse = async (res: any) => {
   if (res.status === "pending_confirmation") {
@@ -45,7 +62,7 @@ const handleChatResponse = async (res: any) => {
 }
 
 const submitPrompt = async () => {
-  if (!selectedModel.value || !prompt.value.trim()) return
+  if (!selectedModel.value || !selectedWorkspace.value || !prompt.value.trim()) return
   loading.value = true
   errorMessage.value = ""
   answer.value = ""
@@ -53,7 +70,7 @@ const submitPrompt = async () => {
   try {
     const res = await $fetch(`${API_BASE}/api/chat`, {
       method: "POST",
-      body: { model: selectedModel.value, prompt: prompt.value },
+      body: { model: selectedModel.value, workspace: selectedWorkspace.value, prompt: prompt.value },
     })
     await handleChatResponse(res)
   } catch (e: any) {
@@ -89,6 +106,13 @@ const respondToConfirm = async (approved: boolean) => {
       <label for="model">モデル</label>
       <select id="model" v-model="selectedModel">
         <option v-for="m in models" :key="m" :value="m">{{ m }}</option>
+      </select>
+    </section>
+
+    <section class="field">
+      <label for="workspace">ワークスペース</label>
+      <select id="workspace" v-model="selectedWorkspace">
+        <option v-for="w in workspaces" :key="w" :value="w">{{ w }}</option>
       </select>
     </section>
 

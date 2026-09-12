@@ -1,15 +1,20 @@
 """
-ブラウザ(Nuxt)から使うFastAPIバックエンド。
+ブラウザ(Nuxt4)から使うFastAPIバックエンド。
 
 エンドポイント:
-  GET  /api/models   利用可能なOllamaモデル一覧を返す
-  POST /api/chat      プロンプトを送信し、ツール呼び出しが必要なら実行して最終回答を返す。
-                       確認が必要なツールの場合は status="pending_confirmation" を返す。
-  POST /api/confirm   pending_id を承認/却下して会話を再開する。
+  GET  /api/models       利用可能なOllamaモデル一覧を返す
+  GET  /api/workspaces   選択可能なワークスペース(BASE_DIR)の一覧を返す
+  POST /api/chat          プロンプトを送信し、ツール呼び出しが必要なら実行して最終回答を返す。
+                          確認が必要なツールの場合は status="pending_confirmation" を返す。
+  POST /api/confirm       pending_id を承認/却下して会話を再開する。
 
 状態管理:
   会話の途中経過(confirm待ちの状態)は pending_id をキーにメモリ上の辞書に保持する。
   プロセス再起動で消える点はローカル単一ユーザー用のMVPとして許容している。
+
+ワークスペース(BASE_DIR)について:
+  ブラウザからの自由入力は受け付けず、agent_tools.ALLOWED_WORKSPACES に
+  事前登録された名前のみ選択できる。実際の操作範囲はサーバー側のこの辞書だけが決める。
 """
 
 from __future__ import annotations
@@ -27,7 +32,6 @@ import agent_tools
 
 app = FastAPI(title="local-llm-agent")
 
-# Nuxtの開発サーバ(デフォルト http://localhost:3000)からのアクセスを許可
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],
@@ -40,7 +44,7 @@ SYSTEM_PROMPT = {
     "content": "あなたはファイル操作を手伝うアシスタントです。",
 }
 
-# pending_id -> {"messages": [...], "tool_name": str, "args": dict}
+# pending_id -> {"model": str, "base_dir": str, "messages": [...], "message": ..., "tool_name": str, "args": dict}
 PENDING: dict[str, dict[str, Any]] = {}
 
 
@@ -51,6 +55,7 @@ PENDING: dict[str, dict[str, Any]] = {}
 
 class ChatRequest(BaseModel):
     model: str
+    workspace: str
     prompt: str
 
 
@@ -71,6 +76,15 @@ class ChatResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # 補助関数
 # ---------------------------------------------------------------------------
+
+
+def resolve_workspace(name: str) -> str:
+    base_dir = agent_tools.ALLOWED_WORKSPACES.get(name)
+    if base_dir is None:
+        raise HTTPException(
+            status_code=400, detail=f"許可されていないワークスペースです: {name}"
+        )
+    return base_dir
 
 
 def extract_tool_calls(message) -> list | None:
@@ -108,24 +122,29 @@ def extract_tool_calls(message) -> list | None:
     return [_FallbackToolCall(name, arguments)]
 
 
-def run_tool(name: str, args: dict) -> str:
+def run_tool(base_dir: str, name: str, args: dict) -> str:
     """confirm不要と判定されたツール、またはconfirm済みのツールを実際に実行する"""
     if name == "list_files":
-        return agent_tools.list_files(args.get("directory", "."))
+        return agent_tools.list_files(base_dir, args.get("directory", "."))
     if name == "read_file":
-        return agent_tools.read_file(args.get("path", ""))
+        return agent_tools.read_file(base_dir, args.get("path", ""))
     if name == "write_file":
-        return agent_tools.write_file(args.get("path", ""), args.get("content", ""))
+        return agent_tools.write_file(
+            base_dir, args.get("path", ""), args.get("content", "")
+        )
     if name == "execute_command":
-        return agent_tools.execute_command(args.get("command", ""))
+        return agent_tools.execute_command(base_dir, args.get("command", ""))
     if name == "edit_file":
         return agent_tools.edit_file(
-            args.get("path", ""), args.get("search", ""), args.get("replace", "")
+            base_dir,
+            args.get("path", ""),
+            args.get("search", ""),
+            args.get("replace", ""),
         )
     return f"エラー: 未対応の道具です: {name}"
 
 
-def build_preview(name: str, args: dict) -> tuple[bool, str]:
+def build_preview(base_dir: str, name: str, args: dict) -> tuple[bool, str]:
     """confirm待ちにする際、フロントエンドに見せるプレビューを作る。
     戻り値: (ok, preview_text)。ok=False の場合はそもそもconfirm不要でエラー即返却。
     """
@@ -135,10 +154,16 @@ def build_preview(name: str, args: dict) -> tuple[bool, str]:
             f"{args.get('path')} に以下の内容を書き込みます:\n\n{args.get('content', '')}",
         )
     if name == "execute_command":
-        return True, f"次のコマンドを実行します:\n  {args.get('command')}"
+        return (
+            True,
+            f"次のコマンドを実行します(作業ディレクトリ: {base_dir}):\n  {args.get('command')}",
+        )
     if name == "edit_file":
         result = agent_tools.preview_edit(
-            args.get("path", ""), args.get("search", ""), args.get("replace", "")
+            base_dir,
+            args.get("path", ""),
+            args.get("search", ""),
+            args.get("replace", ""),
         )
         if not result.ok:
             return False, result.message
@@ -177,8 +202,15 @@ def get_models():
     return {"models": [m["model"] for m in result.get("models", [])]}
 
 
+@app.get("/api/workspaces")
+def get_workspaces():
+    """選択可能なワークスペース名の一覧を返す(実際のパスは返さない)"""
+    return {"workspaces": list(agent_tools.ALLOWED_WORKSPACES.keys())}
+
+
 @app.post("/api/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
+    base_dir = resolve_workspace(req.workspace)
     messages = [SYSTEM_PROMPT, {"role": "user", "content": req.prompt}]
 
     response = ollama.chat(model=req.model, messages=messages, tools=agent_tools.TOOLS)
@@ -186,7 +218,6 @@ def chat(req: ChatRequest):
     tool_calls = extract_tool_calls(message)
 
     if not tool_calls:
-        # ツール呼び出しなし。contentをそのまま最終回答として返す
         return ChatResponse(status="final", answer=message.content or "")
 
     # MVPとして最初の1件のみ処理する(複数ツール呼び出しの逐次処理は未対応)
@@ -195,9 +226,9 @@ def chat(req: ChatRequest):
     args = tool_call.function.arguments
 
     if needs_confirmation(name, args):
-        ok, preview = build_preview(name, args)
+        ok, preview = build_preview(base_dir, name, args)
         if not ok:
-            # プレビュー生成自体がエラー(例: edit_fileのsearchが一意でない)
+            # プレビュー生成自体がエラー(例: edit_fileのsearchが一意でない、パスがbase_dir外)
             # → confirm不要でエラーとして完結させ、モデルに続きを考えさせる
             messages.append(message)
             messages.append({"role": "tool", "content": preview, "tool_name": name})
@@ -207,6 +238,7 @@ def chat(req: ChatRequest):
         pending_id = str(uuid.uuid4())
         PENDING[pending_id] = {
             "model": req.model,
+            "base_dir": base_dir,
             "messages": messages,
             "message": message,
             "tool_name": name,
@@ -221,7 +253,7 @@ def chat(req: ChatRequest):
         )
 
     # confirm不要 → 即実行して最終回答まで進める
-    result = run_tool(name, args)
+    result = run_tool(base_dir, name, args)
     messages.append(message)
     messages.append({"role": "tool", "content": result, "tool_name": name})
     answer = continue_chat(req.model, messages)
@@ -241,9 +273,10 @@ def confirm(req: ConfirmRequest):
     message = pending["message"]
     name = pending["tool_name"]
     args = pending["args"]
+    base_dir = pending["base_dir"]
 
     if req.approved:
-        result = run_tool(name, args)
+        result = run_tool(base_dir, name, args)
     else:
         result = "ユーザーが実行をキャンセルしました"
 
