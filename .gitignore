@@ -28,7 +28,7 @@ Thumbs.db
 # ログ
 *.log
 
-# 将来Nuxt3(フロントエンド)を追加した際用
+# 将来Nuxt(フロントエンド)を追加した際用
 node_modules/
 .nuxt/
 .output/
