@@ -2,21 +2,28 @@
 ブラウザ(Nuxt4)から使うFastAPIバックエンド。
 
 エンドポイント:
-  GET  /api/models       利用可能なOllamaモデル一覧を返す
-  GET  /api/workspaces   選択可能なワークスペース(BASE_DIR)の一覧を返す
-  POST /api/chat          プロンプトを送信し、ツール呼び出しが必要なら実行して最終回答を返す。
-                          確認が必要なツールの場合は status="pending_confirmation" を返す。
-  POST /api/confirm       pending_id を承認/却下して会話を再開する。
+  GET    /api/models              利用可能なOllamaモデル一覧を返す
+  GET    /api/workspaces          選択可能なワークスペース(BASE_DIR)の一覧を返す
+  POST   /api/chat                プロンプトを送信し、ツール呼び出しが必要なら実行して最終回答を返す。
+                                   確認が必要なツールの場合は status="pending_confirmation" を返す。
+  POST   /api/confirm             pending_id を承認/却下して会話を再開する。
+  GET    /api/sessions            過去の会話一覧(タイトル・更新日時)を返す。
+  GET    /api/sessions/{id}/messages  指定した会話の表示用ログ(user/assistantの発言のみ)を返す。
+  DELETE /api/sessions/{id}       指定した会話を削除する。
 
 状態管理:
-  - 会話履歴は session_id をキーに SESSIONS にメッセージ配列として保持する。
+  - 会話は session_id をキーに SESSIONS に SessionRecord として保持する。
     フロントエンドは最初のレスポンスで受け取った session_id を以降のリクエストに
     含めることで、同じ会話の続きとして扱われる。省略すると新しい会話として扱う。
+    過去の会話に戻りたい場合は GET /api/sessions で一覧を取得し、
+    選んだ session_id を次の /api/chat リクエストに含めればよい。
   - confirm待ちの状態は pending_id をキーに PENDING に保持する。
     session_id・base_dir・model・ツール名/引数だけを持たせれば十分で、
     会話履歴自体は SESSIONS 側のリストをそのまま書き換える(同じlistオブジェクトを
     参照しているため、confirm時に読み直す必要はない)。
   - どちらもプロセス再起動で消える点は、ローカル単一ユーザー用のMVPとして許容している。
+    会話を無期限に保持し続けるとメモリを消費し続けるため、不要になった会話は
+    DELETE /api/sessions/{id} で明示的に削除する運用を想定している。
 
 ワークスペース(BASE_DIR)について:
   ブラウザからの自由入力は受け付けず、agent_tools.ALLOWED_WORKSPACES に
@@ -27,6 +34,8 @@ from __future__ import annotations
 
 import json
 import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 import ollama
@@ -50,8 +59,27 @@ SYSTEM_PROMPT = {
     "content": "あなたはファイル操作を手伝うアシスタントです。",
 }
 
-# session_id -> messages(会話全体の履歴。system/user/assistant/toolのメッセージを蓄積する)
-SESSIONS: dict[str, list[Any]] = {}
+TITLE_MAX_LENGTH = 30
+
+
+@dataclass
+class SessionRecord:
+    """1つの会話セッション。messagesはollamaに渡す生のメッセージ履歴
+    (system/user/assistant/toolの混在。assistantのtool呼び出し部分は
+    ollama側のMessageオブジェクトのまま格納されることもある)。
+    """
+
+    messages: list[Any] = field(default_factory=lambda: [dict(SYSTEM_PROMPT)])
+    created_at: datetime = field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: datetime = field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+
+
+# session_id -> SessionRecord
+SESSIONS: dict[str, SessionRecord] = {}
 
 # pending_id -> {"model": str, "base_dir": str, "session_id": str, "tool_name": str, "args": dict}
 PENDING: dict[str, dict[str, Any]] = {}
@@ -66,7 +94,9 @@ class ChatRequest(BaseModel):
     model: str
     workspace: str
     prompt: str
-    session_id: str | None = None  # 省略時は新しい会話として扱う
+    session_id: str | None = (
+        None  # 省略時、または存在しないIDの場合は新しい会話として扱う
+    )
 
 
 class ConfirmRequest(BaseModel):
@@ -84,6 +114,25 @@ class ChatResponse(BaseModel):
     preview: str | None = None
 
 
+class SessionSummary(BaseModel):
+    session_id: str
+    title: str
+    updated_at: str  # ISO8601文字列
+
+
+class SessionListResponse(BaseModel):
+    sessions: list[SessionSummary]
+
+
+class DisplayMessage(BaseModel):
+    role: str  # "user" | "assistant"
+    content: str
+
+
+class SessionMessagesResponse(BaseModel):
+    messages: list[DisplayMessage]
+
+
 # ---------------------------------------------------------------------------
 # 補助関数
 # ---------------------------------------------------------------------------
@@ -99,15 +148,49 @@ def resolve_workspace(name: str) -> str:
     return base_dir
 
 
-def get_or_create_session(session_id: str | None) -> tuple[str, list[Any]]:
-    """session_idが有効なら既存の会話履歴を返し、無ければ新規に作る"""
+def get_or_create_session(session_id: str | None) -> tuple[str, SessionRecord]:
+    """session_idが有効なら既存の会話を返し、無ければ新規に作る"""
     if session_id and session_id in SESSIONS:
         return session_id, SESSIONS[session_id]
 
     new_id = str(uuid.uuid4())
-    messages: list[Any] = [SYSTEM_PROMPT]
-    SESSIONS[new_id] = messages
-    return new_id, messages
+    record = SessionRecord()
+    SESSIONS[new_id] = record
+    return new_id, record
+
+
+def message_field(message: Any, field_name: str) -> Any:
+    """messagesの要素はdictの場合とollamaのMessageオブジェクトの場合が混在するため、
+    どちらでも同じように属性を取り出すためのヘルパー。
+    """
+    if isinstance(message, dict):
+        return message.get(field_name)
+    return getattr(message, field_name, None)
+
+
+def build_title(record: SessionRecord) -> str:
+    """会話一覧に表示するタイトルを、最初のユーザー発言から生成する"""
+    for m in record.messages:
+        if message_field(m, "role") == "user":
+            content = message_field(m, "content") or ""
+            content = content.strip().replace("\n", " ")
+            if len(content) > TITLE_MAX_LENGTH:
+                return content[:TITLE_MAX_LENGTH] + "…"
+            return content or "(無題の会話)"
+    return "(無題の会話)"
+
+
+def build_display_messages(record: SessionRecord) -> list[DisplayMessage]:
+    """user/assistantの発言のみを表示用に抽出する。
+    tool呼び出しの意思表示(content空のassistantメッセージ)やtool結果、systemは除外する。
+    """
+    display = []
+    for m in record.messages:
+        role = message_field(m, "role")
+        content = message_field(m, "content")
+        if role in ("user", "assistant") and content:
+            display.append(DisplayMessage(role=role, content=content))
+    return display
 
 
 def extract_tool_calls(message) -> list | None:
@@ -231,11 +314,53 @@ def get_workspaces():
     return {"workspaces": list(agent_tools.ALLOWED_WORKSPACES.keys())}
 
 
+@app.get("/api/sessions", response_model=SessionListResponse)
+def list_sessions():
+    """過去の会話一覧を、更新が新しい順に返す"""
+    summaries = [
+        SessionSummary(
+            session_id=session_id,
+            title=build_title(record),
+            updated_at=record.updated_at.isoformat(),
+        )
+        for session_id, record in SESSIONS.items()
+    ]
+    summaries.sort(key=lambda s: s.updated_at, reverse=True)
+    return SessionListResponse(sessions=summaries)
+
+
+@app.get(
+    "/api/sessions/{session_id}/messages",
+    response_model=SessionMessagesResponse,
+)
+def get_session_messages(session_id: str):
+    """指定した会話の表示用ログ(user/assistantの発言のみ)を返す"""
+    record = SESSIONS.get(session_id)
+    if record is None:
+        raise HTTPException(
+            status_code=404, detail="該当する会話が見つかりません"
+        )
+    return SessionMessagesResponse(messages=build_display_messages(record))
+
+
+@app.delete("/api/sessions/{session_id}")
+def delete_session(session_id: str):
+    """指定した会話を削除する"""
+    if session_id not in SESSIONS:
+        raise HTTPException(
+            status_code=404, detail="該当する会話が見つかりません"
+        )
+    del SESSIONS[session_id]
+    return {"deleted": session_id}
+
+
 @app.post("/api/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
     base_dir = resolve_workspace(req.workspace)
-    session_id, messages = get_or_create_session(req.session_id)
+    session_id, record = get_or_create_session(req.session_id)
+    messages = record.messages
     messages.append({"role": "user", "content": req.prompt})
+    record.updated_at = datetime.now(timezone.utc)
 
     response = ollama.chat(
         model=req.model, messages=messages, tools=agent_tools.TOOLS
@@ -310,13 +435,14 @@ def confirm(req: ConfirmRequest):
         )
 
     session_id = pending["session_id"]
-    messages = SESSIONS.get(session_id)
-    if messages is None:
+    record = SESSIONS.get(session_id)
+    if record is None:
         raise HTTPException(
             status_code=404,
             detail="対応する会話セッションが見つかりません(サーバー再起動の可能性)",
         )
 
+    messages = record.messages
     name = pending["tool_name"]
     args = pending["args"]
     base_dir = pending["base_dir"]
@@ -329,4 +455,5 @@ def confirm(req: ConfirmRequest):
     messages.append({"role": "tool", "content": result, "tool_name": name})
     answer = continue_chat(pending["model"], messages)
     messages.append({"role": "assistant", "content": answer})
+    record.updated_at = datetime.now(timezone.utc)
     return ChatResponse(status="final", session_id=session_id, answer=answer)

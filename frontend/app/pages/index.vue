@@ -16,6 +16,9 @@ const sessionId = ref<string | null>(null)
 // 表示用の会話ログ(バックエンドの内部メッセージ配列とは別に、UI表示のためだけに保持する)
 const conversation = ref<{ role: "user" | "assistant"; content: string }[]>([])
 
+// 過去の会話一覧(サイドバー表示用)
+const sessions = ref<{ session_id: string; title: string; updated_at: string }[]>([])
+
 // confirm待ちの状態
 const pending = ref<{
   pending_id: string
@@ -48,9 +51,19 @@ const loadWorkspaces = async () => {
   }
 }
 
+const loadSessions = async () => {
+  try {
+    const res = await $fetch<{ sessions: typeof sessions.value }>(`${API_BASE}/api/sessions`)
+    sessions.value = res.sessions
+  } catch (e: any) {
+    errorMessage.value = `会話一覧の取得に失敗しました: ${e.message ?? e}`
+  }
+}
+
 onMounted(() => {
   loadModels()
   loadWorkspaces()
+  loadSessions()
 })
 
 const handleChatResponse = async (res: any) => {
@@ -66,6 +79,7 @@ const handleChatResponse = async (res: any) => {
   } else {
     conversation.value.push({ role: "assistant", content: res.answer ?? "" })
     pending.value = null
+    await loadSessions() // タイトル・更新日時・新規会話の反映のため一覧を再取得
   }
 }
 
@@ -121,81 +135,173 @@ const startNewConversation = () => {
   prompt.value = ""
   errorMessage.value = ""
 }
+
+const openSession = async (id: string) => {
+  if (loading.value) return
+  errorMessage.value = ""
+  pending.value = null
+  try {
+    const res = await $fetch<{ messages: { role: "user" | "assistant"; content: string }[] }>(
+      `${API_BASE}/api/sessions/${id}/messages`
+    )
+    sessionId.value = id
+    conversation.value = res.messages
+  } catch (e: any) {
+    errorMessage.value = `会話の読み込みに失敗しました: ${e.message ?? e}`
+  }
+}
+
+const deleteSession = async (id: string) => {
+  try {
+    await $fetch(`${API_BASE}/api/sessions/${id}`, { method: "DELETE" })
+    if (sessionId.value === id) {
+      startNewConversation()
+    }
+    await loadSessions()
+  } catch (e: any) {
+    errorMessage.value = `会話の削除に失敗しました: ${e.message ?? e}`
+  }
+}
 </script>
 
 <template>
-  <div class="container">
-    <div class="header">
+  <div class="layout">
+    <aside class="sidebar">
+      <button class="secondary full-width" @click="startNewConversation">新しい会話</button>
+      <ul class="session-list">
+        <li
+          v-for="s in sessions"
+          :key="s.session_id"
+          class="session-item"
+          :class="{ active: s.session_id === sessionId }"
+        >
+          <button class="session-title" @click="openSession(s.session_id)">{{ s.title }}</button>
+          <button class="session-delete" title="削除" @click="deleteSession(s.session_id)">×</button>
+        </li>
+      </ul>
+    </aside>
+
+    <main class="container">
       <h1>Local LLM Agent</h1>
-      <button class="secondary" @click="startNewConversation">新しい会話</button>
-    </div>
 
-    <section class="field">
-      <label for="model">モデル</label>
-      <select id="model" v-model="selectedModel">
-        <option v-for="m in models" :key="m" :value="m">{{ m }}</option>
-      </select>
-    </section>
+      <section class="field">
+        <label for="model">モデル</label>
+        <select id="model" v-model="selectedModel">
+          <option v-for="m in models" :key="m" :value="m">{{ m }}</option>
+        </select>
+      </section>
 
-    <section class="field">
-      <label for="workspace">ワークスペース</label>
-      <select id="workspace" v-model="selectedWorkspace">
-        <option v-for="w in workspaces" :key="w" :value="w">{{ w }}</option>
-      </select>
-    </section>
+      <section class="field">
+        <label for="workspace">ワークスペース</label>
+        <select id="workspace" v-model="selectedWorkspace">
+          <option v-for="w in workspaces" :key="w" :value="w">{{ w }}</option>
+        </select>
+      </section>
 
-    <section v-if="conversation.length > 0" class="conversation">
-      <div
-        v-for="(turn, i) in conversation"
-        :key="i"
-        class="turn"
-        :class="turn.role"
-      >
-        <div class="turn-label">{{ turn.role === "user" ? "あなた" : "エージェント" }}</div>
-        <pre>{{ turn.content }}</pre>
-      </div>
-    </section>
+      <section v-if="conversation.length > 0" class="conversation">
+        <div
+          v-for="(turn, i) in conversation"
+          :key="i"
+          class="turn"
+          :class="turn.role"
+        >
+          <div class="turn-label">{{ turn.role === "user" ? "あなた" : "エージェント" }}</div>
+          <pre>{{ turn.content }}</pre>
+        </div>
+      </section>
 
-    <section class="field">
-      <label for="prompt">プロンプト</label>
-      <textarea
-        id="prompt"
-        v-model="prompt"
-        rows="4"
-        placeholder="例: 現在のディレクトリのファイル一覧をlsコマンドで確認して(Ctrl+Enterで送信)"
-        @keydown.ctrl.enter="submitPrompt"
-      />
-    </section>
+      <section class="field">
+        <label for="prompt">プロンプト</label>
+        <textarea
+          id="prompt"
+          v-model="prompt"
+          rows="4"
+          placeholder="例: 現在のディレクトリのファイル一覧をlsコマンドで確認して(Ctrl+Enterで送信)"
+          @keydown.ctrl.enter="submitPrompt"
+        />
+      </section>
 
-    <button :disabled="loading || !!pending" @click="submitPrompt">
-      {{ loading ? "実行中..." : "送信" }}
-    </button>
+      <button :disabled="loading || !!pending" @click="submitPrompt">
+        {{ loading ? "実行中..." : "送信" }}
+      </button>
 
-    <p v-if="errorMessage" class="error">{{ errorMessage }}</p>
+      <p v-if="errorMessage" class="error">{{ errorMessage }}</p>
 
-    <section v-if="pending" class="confirm-box">
-      <h2>確認が必要です</h2>
-      <p>ツール: <code>{{ pending.tool_name }}</code></p>
-      <pre>{{ pending.preview }}</pre>
-      <div class="confirm-actions">
-        <button :disabled="loading" @click="respondToConfirm(true)">実行する</button>
-        <button :disabled="loading" @click="respondToConfirm(false)">キャンセル</button>
-      </div>
-    </section>
+      <section v-if="pending" class="confirm-box">
+        <h2>確認が必要です</h2>
+        <p>ツール: <code>{{ pending.tool_name }}</code></p>
+        <pre>{{ pending.preview }}</pre>
+        <div class="confirm-actions">
+          <button :disabled="loading" @click="respondToConfirm(true)">実行する</button>
+          <button :disabled="loading" @click="respondToConfirm(false)">キャンセル</button>
+        </div>
+      </section>
+    </main>
   </div>
 </template>
 
 <style scoped>
+.layout {
+  display: flex;
+  min-height: 100vh;
+  font-family: system-ui, sans-serif;
+}
+.sidebar {
+  width: 220px;
+  flex-shrink: 0;
+  border-right: 1px solid #ddd;
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+.full-width {
+  width: 100%;
+}
+.session-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  overflow-y: auto;
+}
+.session-item {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+.session-item.active .session-title {
+  font-weight: bold;
+}
+.session-title {
+  flex: 1;
+  text-align: left;
+  background: transparent;
+  border: none;
+  padding: 0.4rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.session-delete {
+  background: transparent;
+  border: none;
+  color: #999;
+  cursor: pointer;
+  padding: 0.25rem 0.4rem;
+}
+.session-delete:hover {
+  color: #b00020;
+}
 .container {
+  flex: 1;
   max-width: 720px;
   margin: 2rem auto;
   padding: 0 1rem;
-  font-family: system-ui, sans-serif;
-}
-.header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
 }
 .field {
   margin-bottom: 1rem;
