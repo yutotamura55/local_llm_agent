@@ -51,6 +51,8 @@ Ollama(LLM) ──tools定義を渡す──► モデルが「使いたい道�
 
 ### バックエンド(FastAPI + Ollama)
 
+`main.py` / `agent_tools.py` はプロジェクトルート直下に置き、`test_tool.py`と同じ1つのuv環境で管理する構成になっている(`backend/`のようなサブディレクトリには分けていない)。
+
 ```bash
 # Ollamaのインストール(Linux/WSL)
 curl -fsSL https://ollama.com/install.sh | sh
@@ -58,7 +60,7 @@ curl -fsSL https://ollama.com/install.sh | sh
 # モデルの取得
 ollama pull qwen2.5:7b
 
-cd backend
+# プロジェクトルートで実行
 uv add fastapi "uvicorn[standard]" ollama
 uv run uvicorn main:app --reload --port 8000
 ```

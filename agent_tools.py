@@ -23,15 +23,20 @@ import shlex
 import subprocess
 from dataclasses import dataclass
 
+from settings import settings
+
 
 # ---------------------------------------------------------------------------
 # 許可されたワークスペース(BASE_DIR)の一覧
 # ブラウザからは自由入力させず、ここで事前に許可したものだけを選択させる。
+#
+# 実際のパスはローカル環境固有の情報(ユーザー名やディレクトリ構成)を含むため
+# コードにハードコードせず、.env の WORKSPACE_<名前>=<パス> という環境変数から
+# settings.py 経由で読み込む(詳細は settings.py を参照)。
+# .env は .gitignore で除外し、命名規則の例は .env.example に記載する。
 # ---------------------------------------------------------------------------
 
-ALLOWED_WORKSPACES: dict[str, str] = {
-    "local_llm_agent": "/mnt/c/Users/tamura/workspace/local_llm_agent",
-}
+ALLOWED_WORKSPACES: dict[str, str] = settings.allowed_workspaces
 
 
 class PathEscapeError(ValueError):
@@ -49,7 +54,9 @@ def resolve_safe_path(base_dir: str, path: str) -> str:
     candidate = path if os.path.isabs(path) else os.path.join(base_real, path)
     target_real = os.path.realpath(candidate)
 
-    if target_real != base_real and not target_real.startswith(base_real + os.sep):
+    if target_real != base_real and not target_real.startswith(
+        base_real + os.sep
+    ):
         raise PathEscapeError(
             f"許可されたワークスペース({base_dir})の外を指すパスです: {path}"
         )
@@ -160,7 +167,9 @@ def is_readonly_command(command: str) -> bool:
     if not tokens:
         return False
 
-    if any(op in command for op in (">", ">>", "|", "&&", ";", "<", "`", "$(")):
+    if any(
+        op in command for op in (">", ">>", "|", "&&", ";", "<", "`", "$(")
+    ):
         return False
 
     head = tokens[0]
@@ -190,7 +199,9 @@ def execute_command(
             timeout=timeout,
         )
     except subprocess.TimeoutExpired:
-        return f"エラー: コマンドがタイムアウトしました({timeout}秒): {command}"
+        return (
+            f"エラー: コマンドがタイムアウトしました({timeout}秒): {command}"
+        )
     except Exception as e:
         return f"エラー: {e}"
 
@@ -214,7 +225,9 @@ class EditPreview:
     message: str  # ok=Falseの場合はエラー内容、ok=Trueの場合はdiff
 
 
-def preview_edit(base_dir: str, path: str, search: str, replace: str) -> EditPreview:
+def preview_edit(
+    base_dir: str, path: str, search: str, replace: str
+) -> EditPreview:
     """実際には書き込まず、一意性チェックとdiff生成だけ行う(base_dir配下に限定)"""
     try:
         safe_path = resolve_safe_path(base_dir, path)
@@ -225,7 +238,9 @@ def preview_edit(base_dir: str, path: str, search: str, replace: str) -> EditPre
         with open(safe_path, "r", encoding="utf-8") as f:
             original = f.read()
     except FileNotFoundError:
-        return EditPreview(ok=False, message=f"ファイルが見つかりません: {path}")
+        return EditPreview(
+            ok=False, message=f"ファイルが見つかりません: {path}"
+        )
     except Exception as e:
         return EditPreview(ok=False, message=str(e))
 
@@ -342,7 +357,10 @@ TOOLS = [
                         "type": "string",
                         "description": "書き込み先のファイルパス",
                     },
-                    "content": {"type": "string", "description": "書き込む内容"},
+                    "content": {
+                        "type": "string",
+                        "description": "書き込む内容",
+                    },
                 },
                 "required": ["path", "content"],
             },
@@ -356,7 +374,10 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string", "description": "実行するコマンド"}
+                    "command": {
+                        "type": "string",
+                        "description": "実行するコマンド",
+                    }
                 },
                 "required": ["command"],
             },
@@ -370,12 +391,18 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "対象ファイルのパス"},
+                    "path": {
+                        "type": "string",
+                        "description": "対象ファイルのパス",
+                    },
                     "search": {
                         "type": "string",
                         "description": "置換対象の完全一致文字列(ファイル内で一意である必要がある)",
                     },
-                    "replace": {"type": "string", "description": "置換後の文字列"},
+                    "replace": {
+                        "type": "string",
+                        "description": "置換後の文字列",
+                    },
                 },
                 "required": ["path", "search", "replace"],
             },

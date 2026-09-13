@@ -63,6 +63,7 @@ const handleChatResponse = async (res: any) => {
 
 const submitPrompt = async () => {
   if (!selectedModel.value || !selectedWorkspace.value || !prompt.value.trim()) return
+  if (loading.value || pending.value) return
   loading.value = true
   errorMessage.value = ""
   answer.value = ""
@@ -122,7 +123,8 @@ const respondToConfirm = async (approved: boolean) => {
         id="prompt"
         v-model="prompt"
         rows="4"
-        placeholder="例: 現在のディレクトリのファイル一覧をlsコマンドで確認して"
+        placeholder="例: 現在のディレクトリのファイル一覧をlsコマンドで確認して(Ctrl+Enterで送信)"
+        @keydown.ctrl.enter="submitPrompt"
       />
     </section>
 
