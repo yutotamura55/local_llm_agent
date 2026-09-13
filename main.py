@@ -9,8 +9,14 @@
   POST /api/confirm       pending_id を承認/却下して会話を再開する。
 
 状態管理:
-  会話の途中経過(confirm待ちの状態)は pending_id をキーにメモリ上の辞書に保持する。
-  プロセス再起動で消える点はローカル単一ユーザー用のMVPとして許容している。
+  - 会話履歴は session_id をキーに SESSIONS にメッセージ配列として保持する。
+    フロントエンドは最初のレスポンスで受け取った session_id を以降のリクエストに
+    含めることで、同じ会話の続きとして扱われる。省略すると新しい会話として扱う。
+  - confirm待ちの状態は pending_id をキーに PENDING に保持する。
+    session_id・base_dir・model・ツール名/引数だけを持たせれば十分で、
+    会話履歴自体は SESSIONS 側のリストをそのまま書き換える(同じlistオブジェクトを
+    参照しているため、confirm時に読み直す必要はない)。
+  - どちらもプロセス再起動で消える点は、ローカル単一ユーザー用のMVPとして許容している。
 
 ワークスペース(BASE_DIR)について:
   ブラウザからの自由入力は受け付けず、agent_tools.ALLOWED_WORKSPACES に
@@ -44,7 +50,10 @@ SYSTEM_PROMPT = {
     "content": "あなたはファイル操作を手伝うアシスタントです。",
 }
 
-# pending_id -> {"model": str, "base_dir": str, "messages": [...], "message": ..., "tool_name": str, "args": dict}
+# session_id -> messages(会話全体の履歴。system/user/assistant/toolのメッセージを蓄積する)
+SESSIONS: dict[str, list[Any]] = {}
+
+# pending_id -> {"model": str, "base_dir": str, "session_id": str, "tool_name": str, "args": dict}
 PENDING: dict[str, dict[str, Any]] = {}
 
 
@@ -57,6 +66,7 @@ class ChatRequest(BaseModel):
     model: str
     workspace: str
     prompt: str
+    session_id: str | None = None  # 省略時は新しい会話として扱う
 
 
 class ConfirmRequest(BaseModel):
@@ -66,6 +76,7 @@ class ConfirmRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     status: str  # "final" | "pending_confirmation"
+    session_id: str | None = None
     answer: str | None = None
     pending_id: str | None = None
     tool_name: str | None = None
@@ -82,9 +93,21 @@ def resolve_workspace(name: str) -> str:
     base_dir = agent_tools.ALLOWED_WORKSPACES.get(name)
     if base_dir is None:
         raise HTTPException(
-            status_code=400, detail=f"許可されていないワークスペースです: {name}"
+            status_code=400,
+            detail=f"許可されていないワークスペースです: {name}",
         )
     return base_dir
+
+
+def get_or_create_session(session_id: str | None) -> tuple[str, list[Any]]:
+    """session_idが有効なら既存の会話履歴を返し、無ければ新規に作る"""
+    if session_id and session_id in SESSIONS:
+        return session_id, SESSIONS[session_id]
+
+    new_id = str(uuid.uuid4())
+    messages: list[Any] = [SYSTEM_PROMPT]
+    SESSIONS[new_id] = messages
+    return new_id, messages
 
 
 def extract_tool_calls(message) -> list | None:
@@ -211,14 +234,22 @@ def get_workspaces():
 @app.post("/api/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
     base_dir = resolve_workspace(req.workspace)
-    messages = [SYSTEM_PROMPT, {"role": "user", "content": req.prompt}]
+    session_id, messages = get_or_create_session(req.session_id)
+    messages.append({"role": "user", "content": req.prompt})
 
-    response = ollama.chat(model=req.model, messages=messages, tools=agent_tools.TOOLS)
+    response = ollama.chat(
+        model=req.model, messages=messages, tools=agent_tools.TOOLS
+    )
     message = response["message"]
     tool_calls = extract_tool_calls(message)
 
     if not tool_calls:
-        return ChatResponse(status="final", answer=message.content or "")
+        messages.append(
+            {"role": "assistant", "content": message.content or ""}
+        )
+        return ChatResponse(
+            status="final", session_id=session_id, answer=message.content or ""
+        )
 
     # MVPとして最初の1件のみ処理する(複数ツール呼び出しの逐次処理は未対応)
     tool_call = tool_calls[0]
@@ -231,21 +262,29 @@ def chat(req: ChatRequest):
             # プレビュー生成自体がエラー(例: edit_fileのsearchが一意でない、パスがbase_dir外)
             # → confirm不要でエラーとして完結させ、モデルに続きを考えさせる
             messages.append(message)
-            messages.append({"role": "tool", "content": preview, "tool_name": name})
+            messages.append(
+                {"role": "tool", "content": preview, "tool_name": name}
+            )
             answer = continue_chat(req.model, messages)
-            return ChatResponse(status="final", answer=answer)
+            messages.append({"role": "assistant", "content": answer})
+            return ChatResponse(
+                status="final", session_id=session_id, answer=answer
+            )
+
+        # 確認待ちの間も、モデルの意思表示(tool_call)自体は会話履歴に含めておく
+        messages.append(message)
 
         pending_id = str(uuid.uuid4())
         PENDING[pending_id] = {
             "model": req.model,
             "base_dir": base_dir,
-            "messages": messages,
-            "message": message,
+            "session_id": session_id,
             "tool_name": name,
             "args": args,
         }
         return ChatResponse(
             status="pending_confirmation",
+            session_id=session_id,
             pending_id=pending_id,
             tool_name=name,
             tool_args=args,
@@ -257,7 +296,8 @@ def chat(req: ChatRequest):
     messages.append(message)
     messages.append({"role": "tool", "content": result, "tool_name": name})
     answer = continue_chat(req.model, messages)
-    return ChatResponse(status="final", answer=answer)
+    messages.append({"role": "assistant", "content": answer})
+    return ChatResponse(status="final", session_id=session_id, answer=answer)
 
 
 @app.post("/api/confirm", response_model=ChatResponse)
@@ -269,8 +309,14 @@ def confirm(req: ConfirmRequest):
             detail="該当するpending_idが見つかりません(サーバー再起動やタイムアウトの可能性)",
         )
 
-    messages = pending["messages"]
-    message = pending["message"]
+    session_id = pending["session_id"]
+    messages = SESSIONS.get(session_id)
+    if messages is None:
+        raise HTTPException(
+            status_code=404,
+            detail="対応する会話セッションが見つかりません(サーバー再起動の可能性)",
+        )
+
     name = pending["tool_name"]
     args = pending["args"]
     base_dir = pending["base_dir"]
@@ -280,8 +326,7 @@ def confirm(req: ConfirmRequest):
     else:
         result = "ユーザーが実行をキャンセルしました"
 
-    messages.append(message)
     messages.append({"role": "tool", "content": result, "tool_name": name})
-
     answer = continue_chat(pending["model"], messages)
-    return ChatResponse(status="final", answer=answer)
+    messages.append({"role": "assistant", "content": answer})
+    return ChatResponse(status="final", session_id=session_id, answer=answer)

@@ -6,9 +6,15 @@ const selectedModel = ref("")
 const workspaces = ref<string[]>([])
 const selectedWorkspace = ref("")
 const prompt = ref("")
-const answer = ref("")
 const loading = ref(false)
 const errorMessage = ref("")
+
+// バックエンドが発行するsession_id。これを送り続けることで会話の続きとして扱われる。
+// nullの間は「まだ会話を始めていない/新しい会話」を意味する。
+const sessionId = ref<string | null>(null)
+
+// 表示用の会話ログ(バックエンドの内部メッセージ配列とは別に、UI表示のためだけに保持する)
+const conversation = ref<{ role: "user" | "assistant"; content: string }[]>([])
 
 // confirm待ちの状態
 const pending = ref<{
@@ -48,6 +54,8 @@ onMounted(() => {
 })
 
 const handleChatResponse = async (res: any) => {
+  sessionId.value = res.session_id ?? sessionId.value
+
   if (res.status === "pending_confirmation") {
     pending.value = {
       pending_id: res.pending_id,
@@ -56,7 +64,7 @@ const handleChatResponse = async (res: any) => {
       preview: res.preview,
     }
   } else {
-    answer.value = res.answer ?? ""
+    conversation.value.push({ role: "assistant", content: res.answer ?? "" })
     pending.value = null
   }
 }
@@ -64,14 +72,22 @@ const handleChatResponse = async (res: any) => {
 const submitPrompt = async () => {
   if (!selectedModel.value || !selectedWorkspace.value || !prompt.value.trim()) return
   if (loading.value || pending.value) return
+
+  const currentPrompt = prompt.value
+  conversation.value.push({ role: "user", content: currentPrompt })
+  prompt.value = ""
+
   loading.value = true
   errorMessage.value = ""
-  answer.value = ""
-  pending.value = null
   try {
     const res = await $fetch(`${API_BASE}/api/chat`, {
       method: "POST",
-      body: { model: selectedModel.value, workspace: selectedWorkspace.value, prompt: prompt.value },
+      body: {
+        model: selectedModel.value,
+        workspace: selectedWorkspace.value,
+        prompt: currentPrompt,
+        session_id: sessionId.value,
+      },
     })
     await handleChatResponse(res)
   } catch (e: any) {
@@ -97,11 +113,22 @@ const respondToConfirm = async (approved: boolean) => {
     loading.value = false
   }
 }
+
+const startNewConversation = () => {
+  sessionId.value = null
+  conversation.value = []
+  pending.value = null
+  prompt.value = ""
+  errorMessage.value = ""
+}
 </script>
 
 <template>
   <div class="container">
-    <h1>Local LLM Agent</h1>
+    <div class="header">
+      <h1>Local LLM Agent</h1>
+      <button class="secondary" @click="startNewConversation">新しい会話</button>
+    </div>
 
     <section class="field">
       <label for="model">モデル</label>
@@ -115,6 +142,18 @@ const respondToConfirm = async (approved: boolean) => {
       <select id="workspace" v-model="selectedWorkspace">
         <option v-for="w in workspaces" :key="w" :value="w">{{ w }}</option>
       </select>
+    </section>
+
+    <section v-if="conversation.length > 0" class="conversation">
+      <div
+        v-for="(turn, i) in conversation"
+        :key="i"
+        class="turn"
+        :class="turn.role"
+      >
+        <div class="turn-label">{{ turn.role === "user" ? "あなた" : "エージェント" }}</div>
+        <pre>{{ turn.content }}</pre>
+      </div>
     </section>
 
     <section class="field">
@@ -143,11 +182,6 @@ const respondToConfirm = async (approved: boolean) => {
         <button :disabled="loading" @click="respondToConfirm(false)">キャンセル</button>
       </div>
     </section>
-
-    <section v-if="answer" class="answer-box">
-      <h2>回答</h2>
-      <pre>{{ answer }}</pre>
-    </section>
   </div>
 </template>
 
@@ -157,6 +191,11 @@ const respondToConfirm = async (approved: boolean) => {
   margin: 2rem auto;
   padding: 0 1rem;
   font-family: system-ui, sans-serif;
+}
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
 }
 .field {
   margin-bottom: 1rem;
@@ -173,10 +212,14 @@ button {
   font-size: 1rem;
   cursor: pointer;
 }
+button.secondary {
+  background: transparent;
+  border: 1px solid #ccc;
+}
 .error {
   color: #b00020;
 }
-.confirm-box, .answer-box {
+.confirm-box {
   margin-top: 1.5rem;
   padding: 1rem;
   border: 1px solid #ccc;
@@ -187,8 +230,35 @@ button {
   gap: 0.5rem;
   margin-top: 0.5rem;
 }
+.conversation {
+  margin-bottom: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+.turn {
+  padding: 0.75rem;
+  border-radius: 4px;
+}
+.turn.user {
+  background: #f0f4ff;
+  align-self: flex-end;
+  max-width: 85%;
+}
+.turn.assistant {
+  background: #f5f5f5;
+  align-self: flex-start;
+  max-width: 85%;
+}
+.turn-label {
+  font-size: 0.75rem;
+  color: #666;
+  margin-bottom: 0.25rem;
+}
 pre {
   white-space: pre-wrap;
   word-break: break-word;
+  margin: 0;
+  font-family: inherit;
 }
 </style>
